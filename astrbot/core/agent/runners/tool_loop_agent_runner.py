@@ -787,11 +787,12 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             )
             return
 
-        if not llm_resp.tools_call_name:
+        has_tool_calls = bool(llm_resp.tools_call_name)
+        if not has_tool_calls:
             await self._complete_with_assistant_response(llm_resp)
 
         # 返回 LLM 结果
-        if llm_resp.reasoning_content:
+        if (not has_tool_calls) and llm_resp.reasoning_content:
             yield AgentResponse(
                 type="llm_result",
                 data=AgentResponseData(
@@ -800,12 +801,12 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     ),
                 ),
             )
-        if llm_resp.result_chain:
+        if (not has_tool_calls) and llm_resp.result_chain:
             yield AgentResponse(
                 type="llm_result",
                 data=AgentResponseData(chain=llm_resp.result_chain),
             )
-        elif llm_resp.completion_text:
+        elif (not has_tool_calls) and llm_resp.completion_text:
             yield AgentResponse(
                 type="llm_result",
                 data=AgentResponseData(
