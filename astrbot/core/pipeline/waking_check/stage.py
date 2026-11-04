@@ -127,6 +127,10 @@ class WakingCheckStage(Stage):
                 is_wake = True
                 event.is_at_or_wake_command = True
                 event.is_wake = True
+                if wake_prefix and self.ctx.astrbot_config["platform_settings"].get(
+                    "send_wake_prefix_to_llm", False
+                ):
+                    event.set_extra("_llm_wake_prefix", wake_prefix)
                 if preserve_whitespace:
                     if wake_prefix:
                         event.message_str = event.message_str.lstrip()[

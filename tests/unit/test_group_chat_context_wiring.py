@@ -66,6 +66,7 @@ def make_event(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("history_state", ["missing", "disabled", "enabled"])
+@pytest.mark.parametrize("wake_prefix", [None, "bot"])
 @pytest.mark.parametrize(
     ("self_id", "mentioned_id", "mention_count", "prompt"),
     [
@@ -73,10 +74,12 @@ def make_event(
         ("12345", 12345, 2, "hello"),
         (12345, "12345", 1, "hello"),
         (12345, 12345, 1, None),
+        ("bot-1", "bot-1", 1, ""),
+        ("bot-1", "bot-1", 1, "  plugin prompt\n    indented body\n"),
     ],
 )
 async def test_current_group_mention_marks_prompt_without_changing_source(
-    history_state, self_id, mentioned_id, mention_count, prompt
+    history_state, wake_prefix, self_id, mentioned_id, mention_count, prompt
 ):
     main = make_main_with_conversation_manager(MagicMock())
     main.context.get_config.return_value = {
@@ -89,6 +92,8 @@ async def test_current_group_mention_marks_prompt_without_changing_source(
         None if history_state == "missing" else SimpleNamespace(on_req_llm=AsyncMock())
     )
     event = make_event()
+    if wake_prefix is not None:
+        event.set_extra("_llm_wake_prefix", wake_prefix)
     event.get_self_id.return_value = self_id
     source_chain = [
         *[At(qq=mentioned_id) for _ in range(mention_count)],
@@ -113,8 +118,10 @@ async def test_current_group_mention_marks_prompt_without_changing_source(
 
     assert vars(req) == {
         **original_request,
-        "prompt": "⚠️[DIRECTED AT YOU]\n" + (prompt or ""),
+        "prompt": "⚠️[DIRECTED AT YOU]\n"
+        + "\n".join(part for part in (wake_prefix, prompt) if part),
     }
+    assert event.get_extra("_llm_wake_prefix") == wake_prefix
     assert event.message_str == "hello"
     assert event.message_obj.message is source_chain
     assert source_chain == original_chain
@@ -125,6 +132,7 @@ async def test_current_group_mention_marks_prompt_without_changing_source(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wake_prefix", [None, "", "bot"])
 @pytest.mark.parametrize(
     ("message_type", "messages"),
     [
@@ -139,10 +147,14 @@ async def test_current_group_mention_marks_prompt_without_changing_source(
         ),
     ],
 )
-async def test_unrelated_or_quoted_mentions_do_not_mark_prompt(message_type, messages):
+async def test_unrelated_or_quoted_mentions_do_not_mark_prompt(
+    wake_prefix, message_type, messages
+):
     main = make_main_with_conversation_manager(MagicMock())
     main.group_chat_context = None
     event = make_event()
+    if wake_prefix is not None:
+        event.set_extra("_llm_wake_prefix", wake_prefix)
     event.get_message_type.return_value = message_type
     event.message_obj.message = messages
     original_chain = copy.deepcopy(messages)
@@ -150,14 +162,52 @@ async def test_unrelated_or_quoted_mentions_do_not_mark_prompt(message_type, mes
 
     await main.decorate_llm_req(event, req)
 
-    assert req.prompt == "hello"
+    assert req.prompt == ("bot\nhello" if wake_prefix else "hello")
     assert event.message_str == "hello"
     assert event.message_obj.message is messages
     assert messages == original_chain
 
 
 @pytest.mark.asyncio
-async def test_current_group_mention_reaches_assembled_user_message_with_history():
+@pytest.mark.parametrize(
+    ("prompt", "wake_prefix", "expected"),
+    [
+        (None, None, None),
+        ("", None, ""),
+        (None, "", None),
+        ("", "", ""),
+        (None, "bot", "bot"),
+        ("", "bot", "bot"),
+        ("bot hello", "bot", "bot\nbot hello"),
+        (
+            "  plugin prompt\n    indented body\n",
+            "bot",
+            "bot\n  plugin prompt\n    indented body\n",
+        ),
+    ],
+)
+async def test_wake_prefix_preserves_empty_and_custom_prompts(
+    prompt, wake_prefix, expected
+):
+    main = make_main_with_conversation_manager(MagicMock())
+    main.group_chat_context = None
+    event = make_event()
+    if wake_prefix is not None:
+        event.set_extra("_llm_wake_prefix", wake_prefix)
+    req = ProviderRequest(prompt=prompt)
+
+    await main.decorate_llm_req(event, req)
+
+    assert req.prompt == expected
+    assert event.message_str == "hello"
+    assert event.message_obj.message == [Plain("hello")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wake_prefix", [None, "bot"])
+async def test_current_group_mention_reaches_assembled_user_message_with_history(
+    wake_prefix,
+):
     main = make_main_with_conversation_manager(MagicMock())
     main.context.get_config.return_value = {
         "provider_ltm_settings": {
@@ -183,6 +233,8 @@ async def test_current_group_mention_reaches_assembled_user_message_with_history
         previous_event.unified_msg_origin
     ][0]
     event = make_event()
+    if wake_prefix is not None:
+        event.set_extra("_llm_wake_prefix", wake_prefix)
     event.message_obj.sender = SimpleNamespace(nickname="Bob")
     event.message_obj.message = [At(qq="bot-1", name="bot"), Plain("hello")]
     await main.group_chat_context.handle_message(event)
@@ -197,7 +249,11 @@ async def test_current_group_mention_reaches_assembled_user_message_with_history
     assert user_message == {
         "role": "user",
         "content": [
-            {"type": "text", "text": "⚠️[DIRECTED AT YOU]\nhello"},
+            {
+                "type": "text",
+                "text": "⚠️[DIRECTED AT YOU]\n"
+                + ("bot\nhello" if wake_prefix else "hello"),
+            },
             {"type": "text", "text": "existing note"},
             {
                 "type": "text",

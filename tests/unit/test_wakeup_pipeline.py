@@ -10,6 +10,7 @@ import pytest
 import pytest_asyncio
 from opentelemetry.trace import format_trace_id, get_current_span
 
+from astrbot.builtin_stars.astrbot.main import Main
 from astrbot.core.agent.hooks import BaseAgentRunHooks
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.astr_agent_run_util import AgentRunner
@@ -19,10 +20,13 @@ from astrbot.core.astr_main_agent.request import prepare_request
 from astrbot.core.config.default import DEFAULT_CONFIG
 from astrbot.core.event_bus import EventBus
 from astrbot.core.log import _log_context
+from astrbot.core.message.components import At, Plain
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.pipeline.context import PipelineContext
 from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
 from astrbot.core.pipeline.scheduler import PipelineScheduler
+from astrbot.core.pipeline.waking_check import stage as waking
+from astrbot.core.platform.agent_wakeup_event import AgentWakeupEvent
 from astrbot.core.platform.astr_message_event import (
     AstrMessageEvent,
     current_message_event,
@@ -30,8 +34,81 @@ from astrbot.core.platform.astr_message_event import (
 from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
-from astrbot.core.provider.entities import LLMResponse
+from astrbot.core.provider.entities import LLMResponse, ProviderRequest
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.event_message_type import (
+    EventMessageType,
+    EventMessageTypeFilter,
+)
+from astrbot.core.star.star_handler import EventType, StarHandlerMetadata
+from astrbot.core.utils import session_waiter as waiter_module
 from astrbot.core.utils import trace as trace_module
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enabled", "prefixes", "text", "mention", "private", "expected_prefix", "cleaned"),
+    [
+        (None, ["bot"], "bot help", None, False, None, "help"),
+        (False, ["bot"], "bot help", None, False, None, "help"),
+        (True, ["bot"], "bot help", None, False, "bot", "help"),
+        (True, ["bot"], "bot help", "bot", False, "bot", "help"),
+        (True, ["bot"], "bot help", None, True, "bot", "help"),
+        (True, ["other", "bot"], "bot   help", None, False, "bot", "help"),
+        (True, [""], "help", None, False, None, "help"),
+        (True, ["bot"], "help", "bot", False, None, "help"),
+        (True, ["bot"], "help", None, True, None, "help"),
+        (True, ["bot"], "bot help", "other", False, None, "bot help"),
+    ],
+)
+async def test_base_wake_prefix_context_preserves_source_and_commands(
+    monkeypatch, enabled, prefixes, text, mention, private, expected_prefix, cleaned
+):
+    settings = {} if enabled is None else {"send_wake_prefix_to_llm": enabled}
+    config = {"admins_id": [], "wake_prefix": prefixes, "platform_settings": settings}
+    stage = waking.WakingCheckStage()
+    await stage.initialize(
+        SimpleNamespace(astrbot_config=config, astrbot_config_id="test", db_helper=None)
+    )
+    monkeypatch.setattr(
+        waking.star_handlers_registry, "get_handlers_by_event_type", lambda *a, **k: []
+    )
+    monkeypatch.setattr(
+        waking.SessionPluginManager,
+        "filter_handlers_by_session",
+        AsyncMock(return_value=[]),
+    )
+    message = AstrBotMessage()
+    message.type = MessageType.FRIEND_MESSAGE if private else MessageType.GROUP_MESSAGE
+    message.self_id = "bot"
+    message.sender = MessageMember(user_id="alice")
+    message.message = ([At(qq=mention)] if mention else []) + [Plain(text)]
+    original_chain = copy.deepcopy(message.message)
+    event = AstrMessageEvent(
+        text,
+        message,
+        PlatformMetadata(id="test", name="aiocqhttp", description="Test"),
+        "group",
+    )
+
+    await stage.process(event)
+
+    assert event.message_str == cleaned
+    assert event.get_extra("_llm_wake_prefix") == expected_prefix
+    assert event.get_messages() == original_chain
+    command = CommandFilter("help")
+    command.handler_params = {}
+    assert command.filter(event, config) is (mention != "other")
+    main = Main.__new__(Main)
+    main.group_chat_context = None
+    request = ProviderRequest(prompt=event.message_str)
+    await main.decorate_llm_req(event, request)
+    expected = f"{expected_prefix}\n{cleaned}" if expected_prefix else cleaned
+    if mention == "bot":
+        expected = "⚠️[DIRECTED AT YOU]\n" + expected
+    assert request.prompt == expected
+    assert event.message_str == cleaned
+    assert event.get_messages() == original_chain
 
 
 @pytest_asyncio.fixture
@@ -44,6 +121,9 @@ async def runtime(monkeypatch):
     Yields:
         Controls for provider execution, delivery, and pipeline completion.
     """
+    monkeypatch.setattr(
+        waking.star_handlers_registry, "get_handlers_by_event_type", lambda *a, **k: []
+    )
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["provider_settings"]["streaming_response"] = False
     config["provider_settings"]["wake_prefix"] = "/llm "
@@ -117,6 +197,9 @@ async def runtime(monkeypatch):
     async def build(*, event, plugin_context, config):
         prepared = await prepare_request(event, plugin_context, config, provider, None)
         assert prepared is not None
+        main = Main.__new__(Main)
+        main.group_chat_context = None
+        await main.decorate_llm_req(event, prepared.request)
         control.events.append(event)
         runner = AgentRunner()
         await runner.reset(
@@ -179,6 +262,130 @@ async def runtime(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("matches_provider", [False, True])
+async def test_base_prefix_reaches_runner_without_restoring_provider_prefix(
+    runtime, enabled, matches_provider
+):
+    config = runtime.context.get_config()
+    config["wake_prefix"] = ["other", "bot"]
+    config["platform_settings"]["send_wake_prefix_to_llm"] = enabled
+    text = "bot llm hello" if matches_provider else "bot hello"
+    message = AstrBotMessage()
+    message.type = MessageType.FRIEND_MESSAGE
+    message.self_id = "bot"
+    message.sender = MessageMember(user_id="alice")
+    message.message = [Plain(text)]
+    event = AstrMessageEvent(
+        text,
+        message,
+        PlatformMetadata(id="target", name="aiocqhttp", description="Target"),
+        "user",
+    )
+    await runtime.context.get_event_queue().put(event)
+    await asyncio.wait_for(runtime.drain(), 2)
+
+    assert event.message_str == ("llm hello" if matches_provider else "hello")
+    assert event.get_messages() == [Plain(text)]
+    assert event.get_extra("_llm_wake_prefix") == ("bot" if enabled else None)
+    assert len(runtime.requests) == int(matches_provider)
+    if matches_provider:
+        assert runtime.requests[0][-1]["content"] == [
+            {"type": "text", "text": "bot\nhello" if enabled else "hello"}
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("need_reply", [False, True])
+async def test_prefix_only_keeps_existing_request_and_waiting_flow(
+    runtime, monkeypatch, enabled, need_reply
+):
+    config = runtime.context.get_config()
+    config["wake_prefix"] = ["bot"]
+    config["platform_settings"].update(
+        send_wake_prefix_to_llm=enabled, empty_mention_waiting_need_reply=need_reply
+    )
+    process_stage = next(
+        stage
+        for stage in runtime.scheduler.stages
+        if type(stage).__name__ == "ProcessStage"
+    )
+    process_stage.agent_sub_stage.prov_wake_prefix = ""
+    main = Main.__new__(Main)
+    main.context = runtime.context
+    module = Main.__module__
+    handler = StarHandlerMetadata(
+        event_type=EventType.AdapterMessageEvent,
+        handler_full_name="test_empty_mention",
+        handler_name="handle_empty_mention",
+        handler_module_path=module,
+        handler=main.handle_empty_mention,
+        event_filters=[EventMessageTypeFilter(EventMessageType.ALL)],
+    )
+    monkeypatch.setitem(
+        waking.star_map,
+        module,
+        SimpleNamespace(name="test-main", display_name="Test Main", activated=True),
+    )
+    monkeypatch.setattr(
+        waking.star_handlers_registry,
+        "get_handlers_by_event_type",
+        lambda event_type, **kwargs: (
+            [handler] if event_type == EventType.AdapterMessageEvent else []
+        ),
+    )
+    monkeypatch.setattr(
+        waking.SessionPluginManager,
+        "filter_handlers_by_session",
+        AsyncMock(side_effect=lambda event, handlers: handlers),
+    )
+    waiting = asyncio.Event()
+    original_keep = waiter_module.SessionController.keep
+
+    def keep(controller, timeout=0, reset_timeout=False):
+        assert timeout == 60 and reset_timeout
+        original_keep(controller, timeout, reset_timeout)
+        waiting.set()
+
+    monkeypatch.setattr(waiter_module.SessionController, "keep", keep)
+    message = AstrBotMessage()
+    message.type = MessageType.FRIEND_MESSAGE
+    message.self_id = "bot"
+    message.sender = MessageMember(user_id="alice")
+    message.message = [Plain("bot")]
+    event = AstrMessageEvent(
+        "bot",
+        message,
+        PlatformMetadata(id="target", name="aiocqhttp", description="Target"),
+        "user",
+    )
+    await runtime.context.get_event_queue().put(event)
+    await asyncio.wait_for(waiting.wait(), 2)
+    session = waiter_module.USER_SESSIONS[event.unified_msg_origin]
+    try:
+        assert len(runtime.requests) == int(need_reply)
+        if need_reply:
+            assert "用户只是通过@" in str(runtime.requests[0])
+        assert event.message_str == ""
+        assert event.get_extra("_llm_wake_prefix") == ("bot" if enabled else None)
+        assert not session.session_controller.future.done()
+        follow_up_message = copy.copy(message)
+        follow_up_message.message = [Plain("Next input")]
+        follow_up = AstrMessageEvent(
+            "Next input", follow_up_message, event.platform_meta, "user"
+        )
+        await waiter_module.SessionWaiter.trigger(event.unified_msg_origin, follow_up)
+        await asyncio.wait_for(runtime.drain(), 2)
+        assert len(runtime.requests) == int(need_reply) + 1
+        assert "Next input" in str(runtime.requests[-1])
+        assert event.unified_msg_origin not in waiter_module.USER_SESSIONS
+    finally:
+        session.session_controller.current_event.set()
+        session._cleanup()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("deliver", [False, True])
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_wakeup_uses_current_context_and_sends_final_reply(
@@ -187,6 +394,8 @@ async def test_wakeup_uses_current_context_and_sends_final_reply(
     """Keep routing, execution scopes, history, and delivery on the normal path."""
     runtime.deliver = deliver
     runtime.agent_stage.streaming_response = streaming
+    runtime.context.get_config()["wake_prefix"] = ["Continue"]
+    runtime.context.get_config()["platform_settings"]["send_wake_prefix_to_llm"] = True
     history = [{"role": "user", "content": "Existing context"}]
     runtime.conversation.history = json.dumps(history)
     umo = "target:GroupMessage:user_group"
@@ -195,6 +404,8 @@ async def test_wakeup_uses_current_context_and_sends_final_reply(
     )
     await asyncio.wait_for(runtime.drain(), 1)
     event = runtime.events[0]
+    assert isinstance(event, AgentWakeupEvent)
+    assert event.get_extra("_llm_wake_prefix") is None
     assert event.unified_msg_origin == umo
     assert event.role == "member"
     assert runtime.requests[0][0] == history[0]

@@ -322,6 +322,10 @@ class Main(star.Star):
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
         """在请求 LLM 前注入人格信息、Identifier、时间、回复内容等 System Prompt"""
+        wake_prefix = event.get_extra("_llm_wake_prefix")
+        if wake_prefix:
+            req.prompt = f"{wake_prefix}\n{req.prompt}" if req.prompt else wake_prefix
+
         if event.get_message_type() == MessageType.GROUP_MESSAGE and any(
             isinstance(comp, Comp.At) and str(comp.qq) == str(event.get_self_id())
             for comp in event.get_messages()

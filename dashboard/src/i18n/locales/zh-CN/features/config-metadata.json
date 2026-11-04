@@ -1011,6 +1011,10 @@
           "description": "隔离对话",
           "hint": "启用后，支持隔离的渠道会为每位群成员使用独立上下文。指令权限请在「管理行为 → 指令」中设置。"
         },
+        "send_wake_prefix_to_llm": {
+          "description": "让模型看到唤醒词",
+          "hint": "启用后，实际触发本次对话的基础唤醒词会单独一行添加到发送给模型的消息中，不影响命令解析。"
+        },
         "friend_message_needs_wake_prefix": {
           "description": "私聊消息需要唤醒词",
           "hint": "私聊消息也必须带上唤醒前缀才能唤醒机器人。"

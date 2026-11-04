@@ -22,7 +22,7 @@ from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.astr_agent_run_util import run_agent
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 from astrbot.core.exceptions import EmptyModelOutputError
-from astrbot.core.message.components import At, AtAll, Plain, Reply
+from astrbot.core.message.components import At, AtAll, Image, Plain, Reply
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.pipeline.process_stage import follow_up
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
@@ -1608,6 +1608,17 @@ async def test_stop_interrupts_pending_regular_tool(mock_hooks):
 
 
 @pytest.mark.parametrize(
+    ("message_str", "wake_prefix", "expected_body"),
+    [
+        pytest.param("  continue  ", None, "continue", id="missing-prefix"),
+        pytest.param("  continue  ", "", "continue", id="empty-prefix"),
+        pytest.param("  continue  ", "bot", "bot\ncontinue", id="wake-prefix"),
+        pytest.param(
+            "  bot continue  ", "bot", "bot\nbot continue", id="same-name-body"
+        ),
+    ],
+)
+@pytest.mark.parametrize(
     ("message_type", "components", "directed"),
     [
         pytest.param(MessageType.GROUP_MESSAGE, [At(qq=100)], True, id="self-integer"),
@@ -1635,37 +1646,60 @@ async def test_stop_interrupts_pending_regular_tool(mock_hooks):
     ],
 )
 def test_event_follow_up_text_marks_only_current_group_mentions(
-    follow_up_event, message_type, components, directed
+    follow_up_event,
+    message_type,
+    components,
+    directed,
+    message_str,
+    wake_prefix,
+    expected_body,
 ):
+    follow_up_event.message_str = message_str
     follow_up_event.message_obj.type = message_type
     follow_up_event.message_obj.message = components
+    if wake_prefix is not None:
+        follow_up_event.set_extra("_llm_wake_prefix", wake_prefix)
     original_components = copy.deepcopy(components)
 
     text = follow_up._event_follow_up_text(follow_up_event)
 
-    expected = "⚠️[DIRECTED AT YOU]\ncontinue" if directed else "continue"
+    expected = "⚠️[DIRECTED AT YOU]\n" + expected_body if directed else expected_body
     assert text == expected
-    assert follow_up_event.message_str == "  continue  "
+    assert follow_up_event.message_str is message_str
     assert follow_up_event.message_obj.message is components
     assert components == original_components
+    assert follow_up_event.get_extra("_llm_wake_prefix") == wake_prefix
 
 
 @pytest.mark.parametrize("message_str", [" \n ", None])
-def test_event_follow_up_text_preserves_outline_fallback(follow_up_event, message_str):
+@pytest.mark.parametrize("wake_prefix", [None, "", "bot"])
+@pytest.mark.parametrize("directed", [False, True])
+def test_event_follow_up_text_preserves_outline_fallback(
+    follow_up_event, message_str, wake_prefix, directed
+):
     follow_up_event.message_str = message_str
+    components = [Plain(text="bot"), Image(file="file:///follow-up.png")]
+    if directed:
+        components.insert(0, At(qq=100))
+    follow_up_event.message_obj.message = components
+    if wake_prefix is not None:
+        follow_up_event.set_extra("_llm_wake_prefix", wake_prefix)
     outline = follow_up_event.get_message_outline().strip()
-    components = follow_up_event.get_messages()
     original_components = copy.deepcopy(components)
 
     text = follow_up._event_follow_up_text(follow_up_event)
 
-    assert text == "⚠️[DIRECTED AT YOU]\n" + outline
+    expected = "⚠️[DIRECTED AT YOU]\n" + outline if directed else outline
+    assert text == expected
     assert follow_up_event.message_str is message_str
     assert follow_up_event.get_messages() is components
     assert components == original_components
+    assert follow_up_event.get_extra("_llm_wake_prefix") == wake_prefix
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("message_str", [" \n ", None])
+@pytest.mark.parametrize("wake_prefix", [None, "", "bot"])
 async def test_empty_follow_up_does_not_become_valid_from_mention(
     runner,
     mock_provider,
@@ -1674,6 +1708,8 @@ async def test_empty_follow_up_does_not_become_valid_from_mention(
     mock_hooks,
     follow_up_event,
     monkeypatch,
+    message_str,
+    wake_prefix,
 ):
     await runner.reset(
         provider=mock_provider,
@@ -1683,7 +1719,9 @@ async def test_empty_follow_up_does_not_become_valid_from_mention(
         agent_hooks=mock_hooks,
         streaming=False,
     )
-    follow_up_event.message_str = " \n "
+    follow_up_event.message_str = message_str
+    if wake_prefix is not None:
+        follow_up_event.set_extra("_llm_wake_prefix", wake_prefix)
     monkeypatch.setattr(
         follow_up_event, "get_message_outline", MagicMock(return_value=" \n ")
     )
@@ -1693,10 +1731,40 @@ async def test_empty_follow_up_does_not_become_valid_from_mention(
     assert text == ""
     assert runner.follow_up(message_text=text) is None
     assert runner._pending_follow_ups == []
-    assert follow_up_event.message_str == " \n "
+    assert follow_up_event.message_str is message_str
+    assert follow_up_event.get_extra("_llm_wake_prefix") == wake_prefix
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message_str", "wake_prefix", "expected_text"),
+    [
+        pytest.param(
+            "  continue  ",
+            None,
+            "⚠️[DIRECTED AT YOU]\ncontinue",
+            id="missing-prefix",
+        ),
+        pytest.param(
+            "  continue  ",
+            "bot",
+            "⚠️[DIRECTED AT YOU]\nbot\ncontinue",
+            id="wake-prefix",
+        ),
+        pytest.param(
+            "  bot continue  ",
+            "bot",
+            "⚠️[DIRECTED AT YOU]\nbot\nbot continue",
+            id="same-name-body",
+        ),
+        pytest.param(
+            None,
+            "bot",
+            "⚠️[DIRECTED AT YOU]\n[At:100] bot [图片]",
+            id="outline-prefix",
+        ),
+    ],
+)
 async def test_captured_group_mention_survives_follow_up_consumption(
     runner,
     mock_provider,
@@ -1706,6 +1774,9 @@ async def test_captured_group_mention_survives_follow_up_consumption(
     mock_event,
     follow_up_event,
     monkeypatch,
+    message_str,
+    wake_prefix,
+    expected_text,
 ):
     monkeypatch.setattr(follow_up, "_ACTIVE_AGENT_RUNNERS", {})
     monkeypatch.setattr(follow_up, "_FOLLOW_UP_ORDER_STATE", {})
@@ -1720,6 +1791,15 @@ async def test_captured_group_mention_survives_follow_up_consumption(
         agent_hooks=mock_hooks,
         streaming=False,
     )
+    follow_up_event.message_str = message_str
+    if message_str is None:
+        follow_up_event.message_obj.message = [
+            At(qq=100),
+            Plain(text="bot"),
+            Image(file="file:///follow-up.png"),
+        ]
+    if wake_prefix is not None:
+        follow_up_event.set_extra("_llm_wake_prefix", wake_prefix)
     components = follow_up_event.get_messages()
     original_components = copy.deepcopy(components)
     capture = None
@@ -1727,7 +1807,7 @@ async def test_captured_group_mention_survives_follow_up_consumption(
     try:
         capture = follow_up.try_capture_follow_up(follow_up_event)
         assert capture is not None
-        assert capture.ticket.text == "⚠️[DIRECTED AT YOU]\ncontinue"
+        assert capture.ticket.text == expected_text
 
         async for _ in runner.step():
             pass
@@ -1741,10 +1821,11 @@ async def test_captured_group_mention_survives_follow_up_consumption(
             provider_request.tool_calls_result[0].tool_calls_result[0].content
         )
         assert "SYSTEM NOTICE" in tool_result
-        assert "1. ⚠️[DIRECTED AT YOU]\ncontinue" in tool_result
-        assert follow_up_event.message_str == "  continue  "
+        assert "1. " + expected_text in tool_result
+        assert follow_up_event.message_str is message_str
         assert follow_up_event.get_messages() is components
         assert components == original_components
+        assert follow_up_event.get_extra("_llm_wake_prefix") == wake_prefix
     finally:
         follow_up.unregister_active_runner(follow_up_event.unified_msg_origin, runner)
         if capture is not None:

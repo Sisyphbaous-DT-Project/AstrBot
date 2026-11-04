@@ -33,7 +33,11 @@ class FollowUpCapture:
 
 def _event_follow_up_text(event: AstrMessageEvent) -> str:
     text = (event.get_message_str() or "").strip()
-    if not text:
+    if text:
+        wake_prefix = event.get_extra("_llm_wake_prefix")
+        if wake_prefix:
+            text = f"{wake_prefix}\n{text}"
+    else:
         text = event.get_message_outline().strip()
     if (
         text

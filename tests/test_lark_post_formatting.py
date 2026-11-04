@@ -1,3 +1,4 @@
+import copy
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -5,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from astrbot.builtin_stars.astrbot.main import Main
 from astrbot.core.astr_main_agent.media import append_quoted_content
 from astrbot.core.astr_main_agent.request import collect_initial_request
 from astrbot.core.message.components import Reply
@@ -112,6 +114,7 @@ async def waking_stage(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("send_wake_prefix", [False, True])
 @pytest.mark.parametrize(
     ("quoted", "title", "wake_prefix", "provider_prefix", "platform", "message_type"),
     [
@@ -125,6 +128,7 @@ async def waking_stage(monkeypatch):
     ],
 )
 async def test_lark_post_preserves_formatting(
+    send_wake_prefix,
     quoted,
     title,
     wake_prefix,
@@ -188,12 +192,20 @@ async def test_lark_post_preserves_formatting(
         assert await extract_quoted_message_text(parsed_event) == expected.strip()
     else:
         waking_stage.ctx.astrbot_config["wake_prefix"] = [wake_prefix]
+        waking_stage.ctx.astrbot_config["platform_settings"][
+            "send_wake_prefix_to_llm"
+        ] = send_wake_prefix
         main_agent_build_config.provider_wake_prefix = provider_prefix
+        original_chain = copy.deepcopy(message.message)
         monkeypatch.setattr(
-            'astrbot.core.astr_main_agent.request._get_session_conv',
+            "astrbot.core.astr_main_agent.request._get_session_conv",
             AsyncMock(return_value=SimpleNamespace(history="[]")),
         )
         await waking_stage.process(parsed_event)
+        cleaned_message = parsed_event.message_str
+        assert parsed_event.get_extra("_llm_wake_prefix") == (
+            wake_prefix if send_wake_prefix and wake_prefix else None
+        )
         request, _ = await collect_initial_request(
             parsed_event, MagicMock(), main_agent_build_config
         )
@@ -203,6 +215,17 @@ async def test_lark_post_preserves_formatting(
             else expected.strip()
         )
         assert request.prompt == expected_prompt
+        main = Main.__new__(Main)
+        main.group_chat_context = None
+        await main.decorate_llm_req(parsed_event, request)
+        expected_model_prompt = (
+            f"{wake_prefix}\n{expected_prompt}"
+            if send_wake_prefix and wake_prefix
+            else expected_prompt
+        )
+        assert request.prompt == expected_model_prompt
+        assert parsed_event.message_str == cleaned_message
+        assert message.message == original_chain
         third_party_stage = third_party.ThirdPartyAgentSubStage()
         third_party_stage.runner_type = "dify"
         third_party_stage.runner_config = {}
@@ -210,10 +233,16 @@ async def test_lark_post_preserves_formatting(
             return_value=None
         )
         hook = AsyncMock(return_value=True)
+
+        async def decorate_request(event, event_type, request):
+            await main.decorate_llm_req(event, request)
+            return True
+
+        hook.side_effect = decorate_request
         monkeypatch.setattr(third_party, "call_event_hook", hook)
         async for _ in third_party_stage.process(parsed_event, provider_prefix):
             pass
-        assert hook.await_args.args[2].prompt == expected_prompt
+        assert hook.await_args.args[2].prompt == expected_model_prompt
 
 
 @pytest.mark.asyncio

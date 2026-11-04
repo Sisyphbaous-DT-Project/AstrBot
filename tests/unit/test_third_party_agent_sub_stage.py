@@ -6,9 +6,10 @@ import pytest
 
 from astrbot.builtin_stars.astrbot.main import Main
 from astrbot.core.agent.runners.dify import dify_agent_runner
-from astrbot.core.message.components import At, Image, Record
+from astrbot.core.message.components import At, Image, Plain, Record
 from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 from astrbot.core.pipeline.process_stage.method.agent_sub_stages import third_party
+from astrbot.core.pipeline.waking_check import stage as waking
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.star.star_handler import EventType
@@ -265,11 +266,13 @@ async def test_dify_empty_request_still_skips_hook_and_runner(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("api_type", ["chat", "agent", "chatflow"])
+@pytest.mark.parametrize("wake_prefix", [None, "bot"])
+@pytest.mark.parametrize("api_type", ["chat", "agent", "chatflow", "workflow"])
 async def test_dify_runner_sends_directed_image_query_and_uploaded_file(
     monkeypatch: pytest.MonkeyPatch,
     third_party_case,
     api_type: str,
+    wake_prefix,
 ):
     case = await third_party_case(
         inline_config={"dify_api_key": "k", "dify_api_type": api_type}
@@ -295,6 +298,18 @@ async def test_dify_runner_sends_directed_image_query_and_uploaded_file(
         yield {"event": "message_end"}
 
     client.chat_messages = MagicMock(side_effect=chat_messages)
+
+    async def workflow_run(**kwargs):
+        yield {
+            "event": "workflow_finished",
+            "workflow_run_id": "workflow",
+            "data": {
+                "status": "succeeded",
+                "outputs": {"astrbot_wf_output": "A test image."},
+            },
+        }
+
+    client.workflow_run = MagicMock(side_effect=workflow_run)
     monkeypatch.setattr(
         dify_agent_runner, "DifyAPIClient", MagicMock(return_value=client)
     )
@@ -306,14 +321,45 @@ async def test_dify_runner_sends_directed_image_query_and_uploaded_file(
         dify_agent_runner.sp, "get_async", AsyncMock(side_effect=get_session_value)
     )
     monkeypatch.setattr(dify_agent_runner.sp, "put_async", AsyncMock())
-    case.event.message_str = ""
+    case.event.message_str = wake_prefix or ""
+    case.event.is_wake = False
+    case.event.is_private_chat.return_value = False
+    extras = {}
+    case.event.get_extra.side_effect = lambda key=None, default=None: extras.get(
+        key, default
+    )
+    case.event.set_extra.side_effect = extras.__setitem__
     case.event.get_message_type.return_value = MessageType.GROUP_MESSAGE
     case.event.get_self_id.return_value = "bot"
     case.event.message_obj.message = [
         At(qq="bot"),
+        *([Plain(wake_prefix)] if wake_prefix else []),
         Image.fromBase64(IMAGE_BASE64),
     ]
     case.event.get_messages.side_effect = lambda: case.event.message_obj.message
+    waking_stage = waking.WakingCheckStage()
+    await waking_stage.initialize(
+        SimpleNamespace(
+            astrbot_config={
+                "admins_id": [],
+                "wake_prefix": ["bot"],
+                "platform_settings": {"send_wake_prefix_to_llm": bool(wake_prefix)},
+            },
+            astrbot_config_id="test",
+            db_helper=None,
+        )
+    )
+    monkeypatch.setattr(
+        waking.star_handlers_registry, "get_handlers_by_event_type", lambda *a, **k: []
+    )
+    monkeypatch.setattr(
+        waking.SessionPluginManager,
+        "filter_handlers_by_session",
+        AsyncMock(return_value=[]),
+    )
+    await waking_stage.process(case.event)
+    assert case.event.message_str == ""
+    assert extras.get("_llm_wake_prefix") == wake_prefix
     main = Main.__new__(Main)
     main.group_chat_context = None
     prompts_at_hook = []
@@ -328,12 +374,23 @@ async def test_dify_runner_sends_directed_image_query_and_uploaded_file(
     results = [item async for item in case.stage.process(case.event, "")]
 
     assert results == [None]
-    assert prompts_at_hook == ["请描述这张图片。"]
+    default_prompt = "" if api_type == "workflow" else "请描述这张图片。"
+    assert prompts_at_hook == [default_prompt]
     result = case.event.set_result.call_args.args[0]
     assert result.result_content_type == ResultContentType.LLM_RESULT
     assert result.chain[0].text == "A test image."
-    query = client.chat_messages.call_args.kwargs
-    assert query["query"] == DIRECTED_PROMPT + "请描述这张图片。"
+    expected_prompt = DIRECTED_PROMPT + "\n".join(
+        part for part in (wake_prefix, default_prompt) if part
+    )
+    if api_type == "workflow":
+        client.chat_messages.assert_not_called()
+        query = client.workflow_run.call_args.kwargs
+        assert query["inputs"]["astrbot_text_query"] == expected_prompt
+        assert "请描述这张图片。" not in expected_prompt
+    else:
+        client.workflow_run.assert_not_called()
+        query = client.chat_messages.call_args.kwargs
+        assert query["query"] == expected_prompt
     assert query["files"] == [
         {
             "type": "image",

@@ -48,6 +48,7 @@ The default AstrBot configuration is as follows:
         "empty_mention_waiting": True,
         "empty_mention_waiting_need_reply": True,
         "friend_message_needs_wake_prefix": False,
+        "send_wake_prefix_to_llm": False,
         "ignore_bot_self_message": False,
         "ignore_at_all": False,
     },
@@ -243,6 +244,12 @@ In the above item (`empty_mention_waiting`), if waiting is triggered, enabling t
 #### `platform_settings.friend_message_needs_wake_prefix`
 
 Whether private messages on platforms require a wake prefix. Default is `false`. When enabled, users must use a wake prefix to trigger a bot response in private chats.
+
+#### `platform_settings.send_wake_prefix_to_llm`
+
+Whether the model receives the base wake prefix that actually matched. Default is `false`. When enabled, the matching `wake_prefix` is added on its own line before the message body sent to the model; for example, `bot hello` becomes `bot\nhello`.
+
+Only the model request changes. Original messages, wake detection, command parsing, and plugin matching are unchanged, and existing body whitespace and line breaks are preserved. This applies only to the base `wake_prefix`; `provider_settings.wake_prefix` (the extra chat wake prefix) keeps its existing behavior.
 
 #### `platform_settings.ignore_bot_self_message`
 

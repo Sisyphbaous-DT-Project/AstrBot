@@ -129,6 +129,7 @@ DEFAULT_CONFIG = {
         "empty_mention_waiting": True,
         "empty_mention_waiting_need_reply": True,
         "friend_message_needs_wake_prefix": False,
+        "send_wake_prefix_to_llm": False,
         "ignore_bot_self_message": False,
         "ignore_at_all": False,
     },
@@ -1190,6 +1191,9 @@ CONFIG_METADATA_2 = {
                     "friend_message_needs_wake_prefix": {
                         "type": "bool",
                         "hint": "启用后，私聊消息需要唤醒前缀才会被处理，同群聊一样。",
+                    },
+                    "send_wake_prefix_to_llm": {
+                        "type": "bool",
                     },
                     "ignore_bot_self_message": {
                         "type": "bool",
@@ -4425,6 +4429,11 @@ CONFIG_METADATA_3 = {
                         "hint": "唤醒机器人的消息前缀的列表，也可以通过 @ 机器人来唤醒。\n\n内置指令（如 `/help`、`/sid`）也依赖唤醒词：群聊中不带唤醒词直接输入将无法触发；私聊在未启用「私聊消息需要唤醒词」时无需前缀，可直接输入指令触发。",
                         "type": "list",
                         "items": {"type": "string"},
+                    },
+                    "platform_settings.send_wake_prefix_to_llm": {
+                        "description": "让模型看到唤醒词",
+                        "hint": "启用后，实际触发本次对话的基础唤醒词会单独一行添加到发送给模型的消息中，不影响命令解析。",
+                        "type": "bool",
                     },
                     "platform_settings.friend_message_needs_wake_prefix": {
                         "description": "私聊消息需要唤醒词",

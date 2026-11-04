@@ -990,6 +990,10 @@
           "description": "Isolate Conversation",
           "hint": "On supported platforms, each group member has a separate conversation context when enabled. Manage command permissions under Handlers → Command."
         },
+        "send_wake_prefix_to_llm": {
+          "description": "Show Wake Word to Model",
+          "hint": "When enabled, the base wake word that triggered the current conversation is added on its own line to the message sent to the model, without affecting command parsing."
+        },
         "friend_message_needs_wake_prefix": {
           "description": "Private Messages Require Wake Word",
           "hint": "Private messages must also include a wake prefix to activate the bot."
